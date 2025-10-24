@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.0
 // @description  Rebind WASD / Q / Space / Y / Left Click for narrow.one, apply to game input, and show visualizer from N1CN clan + simple UI. Persist bindings in localStorage.
-// @author       dodobird1 feat. ChatGPT
+// @author       dodobird1
 // @match        https://narrow.one/
 // @grant        none
 // @run-at       document-idle
