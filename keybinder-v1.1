@@ -1,0 +1,579 @@
+// ==UserScript==
+// @name         keybinder + visualizer v1.1
+// @namespace    http://tampermonkey.net/
+// @version      1.1
+// @description  Rebind WASD / Q / Space / Y / Left Click, apply to game input, show visualizer, export/import config, and right-click Scope toggle.
+// @author       dodobird1
+// @match        https://narrow.one/
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /*************************************************************************
+   * CONFIG
+   *************************************************************************/
+  const STORAGE_KEY = 'narrow_one_keybinder_config_v2';
+  const ACTIONS = ['forward','left','back','right','shoot','melee','jump','perspective'];
+  const DEFAULT_BINDINGS = {
+    forward: 'KeyW', left: 'KeyA', back: 'KeyS', right: 'KeyD',
+    shoot: 'Mouse0', melee: 'KeyQ', jump: 'Space', perspective: 'KeyY'
+  };
+  const DEFAULT_OPTIONS = { rightClickScope: false };
+
+  /*************************************************************************
+   * Utilities
+   *************************************************************************/
+  function loadConfig() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return {bindings: {...DEFAULT_BINDINGS}, options: {...DEFAULT_OPTIONS}};
+      const parsed = JSON.parse(raw);
+      return {
+        bindings: Object.assign({}, DEFAULT_BINDINGS, parsed.bindings || {}),
+        options: Object.assign({}, DEFAULT_OPTIONS, parsed.options || {})
+      };
+    } catch (e) {
+      console.warn('Failed to load config', e);
+      return {bindings: {...DEFAULT_BINDINGS}, options: {...DEFAULT_OPTIONS}};
+    }
+  }
+  function saveConfig(cfg){ localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); }
+
+  const config = loadConfig();
+  const bindings = config.bindings;
+  const options = config.options;
+
+  function codeToLabel(code){
+    if(!code) return '';
+    if(code.startsWith('Key')) return code.slice(3);
+    if(code.startsWith('Digit')) return code.slice(5);
+    if(code === 'Space') return 'SPACE';
+    if(code.startsWith('Mouse')){
+      const n = parseInt(code.slice(5));
+      if(n===0) return 'LMB';
+      if(n===1) return 'MMB';
+      if(n===2) return 'RMB';
+      return 'M'+n;
+    }
+    return code;
+  }
+
+  function codeToKeyAndKeyCode(code){
+    if(code === 'Space') return {key:' ', keyCode:32};
+    if(code.startsWith('Key')) {
+      const ch = code.slice(3);
+      return {key: ch.toLowerCase(), keyCode: ch.charCodeAt(0)};
+    }
+    if(code.startsWith('Digit')) {
+      const num = code.slice(5);
+      return {key:num, keyCode:num.charCodeAt(0)};
+    }
+    return {key: code, keyCode: 0};
+  }
+
+  // Find dispatch target: pointerLockElement (when active), else canvas element if present, else document
+  function getDispatchTarget(){
+    if (document.pointerLockElement) return document.pointerLockElement;
+    const canv = document.querySelector('canvas');
+    if (canv) return canv;
+    return document;
+  }
+
+  // Dispatch KeyboardEvent to preferred target
+  function simulateKeyboard(code, type='keydown'){
+    const {key, keyCode} = codeToKeyAndKeyCode(code);
+    const ev = new KeyboardEvent(type, {
+      key, code, keyCode, which: keyCode, bubbles: true, cancelable: true
+    });
+    try { Object.defineProperty(ev, 'keyCode', {value: keyCode}); } catch(e){}
+    const target = getDispatchTarget();
+    target.dispatchEvent(ev);
+  }
+
+  // Dispatch MouseEvent to preferred target
+  function simulateMouse(button, type='mousedown'){
+    const target = getDispatchTarget();
+    // create mouse event with minimal necessary properties
+    const ev = new MouseEvent(type, {
+      bubbles: true, cancelable: true, view: window, button, buttons: 1 << button,
+      clientX: window.innerWidth/2, clientY: window.innerHeight/2
+    });
+    target.dispatchEvent(ev);
+  }
+
+  /*************************************************************************
+   * UI - toggle button, rebind panel, export/import
+   *************************************************************************/
+  let enabled = true;
+  let scoping = false;            // whether right-click-scope is active
+  let scopeSimulated = false;     // whether we simulated the mousedown for scope (so we'll release it)
+
+  // Small helper for creating styled buttons
+  function mkbtn(text){ const b=document.createElement('button'); b.innerText=text; Object.assign(b.style, {cursor:'pointer', padding:'6px 8px', borderRadius:'8px', border:'1px solid white', background:'transparent', color:'white'}); return b; }
+
+  // Open button
+  const openBtn = document.createElement('div');
+  openBtn.innerText = 'Keybinds';
+  Object.assign(openBtn.style, {position:'fixed', right:'11px', bottom:'11px', padding:'8px 12px', background:'rgba(0,0,0,0.6)', color:'white', borderRadius:'10px', border:'1px solid white', cursor:'pointer', zIndex:99999, backdropFilter:'blur(6px)', fontSize:'14px', userSelect:'none'});
+  document.body.appendChild(openBtn);
+
+  // Panel
+  const panel = document.createElement('div');
+  panel.classList.add('narrow-rebind-ui');
+  Object.assign(panel.style, {position:'fixed', right:'11px', bottom:'60px', width:'380px', maxWidth:'95vw', padding:'12px', background:'rgba(0,0,0,0.75)', color:'white', borderRadius:'12px', border:'1px solid white', zIndex:99999, display:'none', backdropFilter:'blur(8px)'});
+  document.body.appendChild(panel);
+
+  const title = document.createElement('div'); title.innerText = 'narrow.one — Key Rebinds'; Object.assign(title.style, {fontWeight:'700', marginBottom:'8px'}); panel.appendChild(title);
+
+  // status toggle
+  const statusRow = document.createElement('div'); Object.assign(statusRow.style, {display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'8px'}); panel.appendChild(statusRow);
+  const statusLabel = document.createElement('div'); statusLabel.innerText = 'Enabled:'; statusRow.appendChild(statusLabel);
+  const statusToggle = mkbtn(enabled ? 'On':'Off'); statusRow.appendChild(statusToggle);
+  statusToggle.addEventListener('click', ()=>{ enabled=!enabled; statusToggle.innerText = enabled ? 'On':'Off'; statusToggle.style.opacity = enabled ? '1':'0.6'; });
+
+  // right-click scope toggle
+  const rightClickRow = document.createElement('div'); Object.assign(rightClickRow.style, {display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'8px'}); panel.appendChild(rightClickRow);
+  const rightClickLabel = document.createElement('div'); rightClickLabel.innerText = 'Right-click Scope:'; rightClickRow.appendChild(rightClickLabel);
+  const rightClickToggle = mkbtn(options.rightClickScope ? 'On':'Off'); rightClickRow.appendChild(rightClickToggle);
+  rightClickToggle.addEventListener('click', ()=>{ options.rightClickScope = !options.rightClickScope; rightClickToggle.innerText = options.rightClickScope ? 'On':'Off'; saveConfig(config); });
+
+  // Action rows
+  const rows = document.createElement('div'); Object.assign(rows.style,{display:'grid', gap:'6px', gridTemplateColumns:'1fr'}); panel.appendChild(rows);
+  const actionRowEls = {};
+  const humanNames = { forward:'Forward (move)', left:'Left (move)', back:'Back (move)', right:'Right (move)', shoot:'Shoot (LMB)', melee:'Melee/Bow', jump:'Jump', perspective:'Perspective' };
+  function makeActionRow(action, humanLabel){
+    const row = document.createElement('div'); Object.assign(row.style, {display:'flex', justifyContent:'space-between', alignItems:'center', gap:'8px'});
+    const left = document.createElement('div'); left.innerText = humanLabel; left.style.width='140px'; row.appendChild(left);
+    const bindingLabel = document.createElement('div'); bindingLabel.innerText = codeToLabel(bindings[action] || DEFAULT_BINDINGS[action]); bindingLabel.style.flex='1'; bindingLabel.style.textAlign='center'; row.appendChild(bindingLabel);
+    const btnBind = mkbtn('Bind'); const btnClear = mkbtn('Clear');
+    const rg = document.createElement('div'); rg.style.display='flex'; rg.style.gap='6px'; rg.appendChild(btnBind); rg.appendChild(btnClear); row.appendChild(rg);
+    rows.appendChild(row);
+    actionRowEls[action] = {bindingLabel, btnBind, btnClear};
+    return {btnBind, btnClear, bindingLabel};
+  }
+  for(const a of ACTIONS) makeActionRow(a, humanNames[a]||a);
+
+  // bottom controls
+  const bottom = document.createElement('div'); Object.assign(bottom.style,{display:'flex', gap:'8px', marginTop:'8px', justifyContent:'space-between'}); panel.appendChild(bottom);
+  const exportBtn = mkbtn('Export JSON'); const importBtn = mkbtn('Import JSON'); const resetBtn = mkbtn('Reset'); const saveBtn = mkbtn('Save'); const closeBtn = mkbtn('Close');
+  bottom.appendChild(exportBtn); bottom.appendChild(importBtn); bottom.appendChild(resetBtn); bottom.appendChild(saveBtn); bottom.appendChild(closeBtn);
+
+  openBtn.addEventListener('click', ()=>{ panel.style.display = panel.style.display === 'none' ? 'block' : 'none'; });
+  closeBtn.addEventListener('click', ()=> panel.style.display='none');
+
+  resetBtn.addEventListener('click', ()=>{
+    for(const a of ACTIONS) bindings[a] = DEFAULT_BINDINGS[a];
+    Object.assign(options, DEFAULT_OPTIONS);
+    rightClickToggle.innerText = options.rightClickScope ? 'On':'Off';
+    saveConfig(config); refreshActionLabels(); updateVisualizerLabels();
+  });
+
+  saveBtn.addEventListener('click', ()=>{
+    saveConfig(config); refreshActionLabels(); updateVisualizerLabels(); alert('Saved.');
+  });
+
+  // export modal
+  function openExportModal(){
+    const data = JSON.stringify({bindings, options}, null, 2);
+    const modal = document.createElement('div'); Object.assign(modal.style,{position:'fixed', left:'50%', top:'50%', transform:'translate(-50%,-50%)', zIndex:100000, background:'rgba(0,0,0,0.95)', color:'white', padding:'12px', border:'1px solid white', borderRadius:'10px', maxWidth:'90vw', maxHeight:'80vh', overflow:'auto'});
+    const heading = document.createElement('div'); heading.innerText='Exported JSON'; heading.style.marginBottom='8px'; modal.appendChild(heading);
+    const ta = document.createElement('textarea'); ta.value = data; Object.assign(ta.style,{width:'640px', maxWidth:'80vw', height:'320px', background:'#111', color:'white', padding:'8px'}); modal.appendChild(ta);
+    const row = document.createElement('div'); row.style.display='flex'; row.style.gap='8px'; row.style.marginTop='8px';
+    const copyBtn = mkbtn('Copy'); copyBtn.addEventListener('click', ()=>{ ta.select(); try{ document.execCommand('copy'); alert('Copied'); }catch(e){ alert('Copy failed'); }});
+    const downloadBtn = mkbtn('Download .json'); downloadBtn.addEventListener('click', ()=>{ const blob=new Blob([data], {type:'application/json'}); const url = URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='narrow_one_keybindings.json'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); });
+    const close = mkbtn('Close'); close.addEventListener('click', ()=> modal.remove());
+    row.appendChild(copyBtn); row.appendChild(downloadBtn); row.appendChild(close);
+    modal.appendChild(row); document.body.appendChild(modal);
+  }
+  exportBtn.addEventListener('click', openExportModal);
+
+  // import modal
+  function openImportModal(){
+    const modal = document.createElement('div'); Object.assign(modal.style,{position:'fixed', left:'50%', top:'50%', transform:'translate(-50%,-50%)', zIndex:100000, background:'rgba(0,0,0,0.95)', color:'white', padding:'12px', border:'1px solid white', borderRadius:'10px', maxWidth:'90vw', maxHeight:'80vh', overflow:'auto'});
+    const heading = document.createElement('div'); heading.innerText='Import JSON'; heading.style.marginBottom='8px'; modal.appendChild(heading);
+    const ta = document.createElement('textarea'); ta.placeholder='{"bindings":{...},"options":{...}}'; Object.assign(ta.style,{width:'640px', maxWidth:'80vw', height:'320px', background:'#111', color:'white', padding:'8px'}); modal.appendChild(ta);
+    const row = document.createElement('div'); row.style.display='flex'; row.style.gap='8px'; row.style.marginTop='8px';
+    const imp = mkbtn('Import'); imp.addEventListener('click', ()=>{
+      try {
+        const parsed = JSON.parse(ta.value);
+        if(parsed.bindings) {
+          for(const k of Object.keys(DEFAULT_BINDINGS)) if(parsed.bindings[k]) bindings[k] = parsed.bindings[k];
+        }
+        if(parsed.options) {
+          for(const k of Object.keys(DEFAULT_OPTIONS)) if(typeof parsed.options[k] !== 'undefined') options[k] = parsed.options[k];
+        }
+        saveConfig(config);
+        rightClickToggle.innerText = options.rightClickScope ? 'On':'Off';
+        refreshActionLabels(); updateVisualizerLabels();
+        alert('Imported.');
+        modal.remove();
+      } catch(err){ alert('Import failed: ' + err); }
+    });
+    const close = mkbtn('Close'); close.addEventListener('click', ()=> modal.remove());
+    row.appendChild(imp); row.appendChild(close); modal.appendChild(row); document.body.appendChild(modal);
+  }
+  importBtn.addEventListener('click', openImportModal);
+
+  /*************************************************************************
+   * Binding capture
+   *************************************************************************/
+  let capturingAction = null;
+  let capturePrompt = null;
+  function beginCapture(action){
+    capturingAction = action;
+    if(!capturePrompt){
+      capturePrompt = document.createElement('div');
+      capturePrompt.innerText = 'Press any key or mouse button to bind... (Esc to cancel)';
+      Object.assign(capturePrompt.style,{color:'#ffea00', marginTop:'8px', fontWeight:'bold'});
+      panel.appendChild(capturePrompt);
+    } else capturePrompt.style.display='block';
+
+    function onKey(e){ if(!e.isTrusted) return; if(e.code==='Escape'){ endCapture(true); return; } bindings[capturingAction] = e.code; endCapture(false); }
+    function onMouse(e){ if(!e.isTrusted) return; bindings[capturingAction] = 'Mouse' + e.button; e.preventDefault(); e.stopPropagation(); endCapture(false); }
+
+    beginCapture._onKey = onKey; beginCapture._onMouse = onMouse;
+    document.addEventListener('keydown', onKey, {capture:true});
+    document.addEventListener('mousedown', onMouse, {capture:true});
+  }
+  function endCapture(cancelled){
+    if(beginCapture._onKey) document.removeEventListener('keydown', beginCapture._onKey, {capture:true});
+    if(beginCapture._onMouse) document.removeEventListener('mousedown', beginCapture._onMouse, {capture:true});
+    capturingAction = null;
+    if(capturePrompt) capturePrompt.style.display='none';
+    refreshActionLabels();
+    if(!cancelled) saveConfig(config);
+  }
+
+  for(const a of ACTIONS){
+    const {btnBind, btnClear} = actionRowEls[a];
+    btnBind.addEventListener('click', (ev)=>{ ev.stopPropagation(); beginCapture(a); });
+    btnClear.addEventListener('click', (ev)=>{ ev.stopPropagation(); bindings[a] = null; refreshActionLabels(); saveConfig(config); });
+  }
+
+  function refreshActionLabels(){
+    for(const a of ACTIONS){
+      const el = actionRowEls[a];
+      if(!el) continue;
+      el.bindingLabel.innerText = codeToLabel(bindings[a] || DEFAULT_BINDINGS[a]);
+    }
+  }
+
+  /*************************************************************************
+   * Visualizer (keeps showing bindings and pressed state)
+   *************************************************************************/
+  const viz = document.createElement('div'); Object.assign(viz.style, {position:'fixed', right:'11px', bottom:'160px', padding:'10px', borderRadius:'12px', border:'1px solid white', background:'rgba(0,0,0,0.4)', color:'white', zIndex:99990, userSelect:'none', backdropFilter:'blur(8px)'}); document.body.appendChild(viz);
+  const grid = document.createElement('div'); Object.assign(grid.style, {display:'grid', gridTemplateColumns:'repeat(3,56px)', gridAutoRows:'56px', gap:'8px'}); viz.appendChild(grid);
+
+  function makeKeyBox(id, title){
+    const b = document.createElement('div'); Object.assign(b.style, {display:'flex', flexDirection:'column', justifyContent:'center', alignItems:'center', width:'56px', height:'56px', borderRadius:'10px', border:'1px solid white', background:'transparent', fontSize:'12px', textAlign:'center', padding:'4px'}); b.dataset.keyId = id; b.innerHTML = `<div style="font-size:10px;opacity:0.8">${title}</div><div class="label" style="font-weight:700"></div>`; return b;
+  }
+
+  const keyBoxes = {
+    forward: makeKeyBox('forward','Forward'),
+    left: makeKeyBox('left','Left'),
+    back: makeKeyBox('back','Back'),
+    right: makeKeyBox('right','Right'),
+    melee: makeKeyBox('melee','Melee'),
+    jump: makeKeyBox('jump','Jump'),
+    perspective: makeKeyBox('persp','Perspective'),
+    shoot: makeKeyBox('shoot','Shoot (LMB)')
+  };
+
+  grid.appendChild(keyBoxes.melee); grid.appendChild(keyBoxes.forward); grid.appendChild(keyBoxes.perspective);
+  grid.appendChild(keyBoxes.left); grid.appendChild(keyBoxes.back); grid.appendChild(keyBoxes.right);
+  const shootBox = keyBoxes.shoot; shootBox.style.gridColumn='1 / span 1'; grid.appendChild(shootBox);
+  const spaceBox = keyBoxes.jump; spaceBox.style.gridColumn='2 / span 2'; grid.appendChild(spaceBox);
+
+  const pressedCodes = {}; // code->bool
+
+  function updateVisualizerLabels(){
+    for(const a of ACTIONS){
+      const box = keyBoxes[a];
+      if(!box) continue;
+      const labelEl = box.querySelector('.label');
+      const code = bindings[a] || DEFAULT_BINDINGS[a];
+      labelEl.innerText = codeToLabel(code);
+      const isPressed = pressedCodes[code] === true || (a === 'shoot' && scoping === true);
+      box.style.background = isPressed ? 'white' : 'transparent';
+      box.style.color = isPressed ? 'black' : 'white';
+    }
+  }
+  updateVisualizerLabels();
+
+  /*************************************************************************
+   * Core remapping & Right-click scoping logic
+   *************************************************************************/
+  function findActionForInputCode(code){
+    for(const a of ACTIONS){
+      const c = bindings[a] || DEFAULT_BINDINGS[a];
+      if(c === code) return a;
+    }
+    return null;
+  }
+
+  function startScope(){
+    if(scoping) return;
+    scoping = true;
+    // Simulate holding LMB down (or whatever default shoot is expected by the game)
+    const originalForShoot = DEFAULT_BINDINGS.shoot; // usually 'Mouse0'
+    if(originalForShoot && originalForShoot.startsWith('Mouse')){
+      simulateMouse(parseInt(originalForShoot.slice(5)), 'mousedown');
+      scopeSimulated = true;
+      pressedCodes[originalForShoot] = true;
+    } else if(originalForShoot && originalForShoot.startsWith('Key')){
+      // If the game originally expects a keyboard key for shoot (unlikely), simulate keydown
+      simulateKeyboard(originalForShoot, 'keydown');
+      scopeSimulated = true;
+      pressedCodes[originalForShoot] = true;
+    } else {
+      // fallback: simulate LMB mousedown
+      simulateMouse(0, 'mousedown');
+      scopeSimulated = true;
+      pressedCodes['Mouse0'] = true;
+    }
+    updateVisualizerLabels();
+  }
+
+  function stopScope(){
+    if(!scoping) return;
+    scoping = false;
+    if(scopeSimulated){
+      const originalForShoot = DEFAULT_BINDINGS.shoot;
+      if(originalForShoot && originalForShoot.startsWith('Mouse')){
+        simulateMouse(parseInt(originalForShoot.slice(5)), 'mouseup');
+        pressedCodes[originalForShoot] = false;
+      } else if(originalForShoot && originalForShoot.startsWith('Key')){
+        simulateKeyboard(originalForShoot, 'keyup');
+        pressedCodes[originalForShoot] = false;
+      } else {
+        simulateMouse(0,'mouseup');
+        pressedCodes['Mouse0'] = false;
+      }
+    }
+    scopeSimulated = false;
+    updateVisualizerLabels();
+  }
+
+  // KEYDOWN
+  function onKeyDown(e){
+    if(!e.isTrusted) return;
+    // ignore events targeted to our UI
+    if(e.target && e.target.closest && e.target.closest('.narrow-rebind-ui')) return;
+    const code = e.code;
+    pressedCodes[code] = true;
+
+    // If scoping and this is the shoot key binding -> release scope BEFORE letting shoot process
+    const currentShootBind = bindings.shoot || DEFAULT_BINDINGS.shoot;
+    const currentMeleeBind = bindings.melee || DEFAULT_BINDINGS.melee;
+    if(scoping && (code === currentShootBind || code === currentMeleeBind)){
+      // stop scope; do NOT swallow event so remapping can still do its job (shoot will be processed normally)
+      stopScope();
+      // continue to remapping below so that pressing the shoot key still triggers a shot
+    }
+
+    if(!enabled){ updateVisualizerLabels(); return; }
+
+    // find action that this code corresponds to under current bindings
+    const action = findActionForInputCode(code);
+    if(!action){ updateVisualizerLabels(); return; }
+
+    // original input the game expects for that action
+    const original = DEFAULT_BINDINGS[action];
+    if(!original || original === code){ updateVisualizerLabels(); return; } // no remap needed
+
+    // Prevent real event, and synthesize original (keydown)
+    e.preventDefault(); e.stopImmediatePropagation();
+
+    if(original.startsWith('Mouse')){
+      simulateMouse(parseInt(original.slice(5)), 'mousedown');
+      pressedCodes[original] = true;
+    } else {
+      simulateKeyboard(original, 'keydown');
+    }
+
+    updateVisualizerLabels();
+  }
+
+  // KEYUP
+  function onKeyUp(e){
+    if(!e.isTrusted) return;
+    if(e.target && e.target.closest && e.target.closest('.narrow-rebind-ui')) return;
+    const code = e.code;
+    pressedCodes[code] = false;
+
+    if(!enabled){ updateVisualizerLabels(); return; }
+
+    const action = findActionForInputCode(code);
+    if(!action){ updateVisualizerLabels(); return; }
+
+    const original = DEFAULT_BINDINGS[action];
+    if(!original || original === code){ updateVisualizerLabels(); return; }
+
+    e.preventDefault(); e.stopImmediatePropagation();
+
+    if(original.startsWith('Mouse')){
+      simulateMouse(parseInt(original.slice(5)), 'mouseup');
+      pressedCodes[original] = false;
+    } else {
+      simulateKeyboard(original, 'keyup');
+    }
+
+    updateVisualizerLabels();
+  }
+
+  // MOUSEDOWN
+  function onMouseDown(e){
+    if(!e.isTrusted) return;
+    // avoid acting when clicking in UI
+    if(e.target && e.target.closest && e.target.closest('.narrow-rebind-ui')) return;
+    const code = 'Mouse' + e.button;
+    pressedCodes[code] = true;
+
+    // Right-click Scope behaviour: only if option enabled and right button
+    if(options.rightClickScope && e.button === 2){
+      e.preventDefault(); e.stopImmediatePropagation();
+      // toggle scope
+      if(!scoping) startScope(); else stopScope();
+      updateVisualizerLabels();
+      return;
+    }
+
+    // If scoping and left-click occurs: per request do NOT release scope on left-click.
+    // However, if left click occurs and shoot is bound away from Mouse0 and we want to prevent actual LMB acting as shoot,
+    // we should suppress real LMB (unless shoot binding is Mouse0).
+    const currentShootBind = bindings.shoot || DEFAULT_BINDINGS.shoot;
+    if(e.button === 0 && currentShootBind !== 'Mouse0'){
+      // If scoping, do not stop scope and do not allow this real left click to act as a shoot:
+      e.preventDefault(); e.stopImmediatePropagation();
+      // Do not synthesize anything here: the user's shoot key will be used to trigger shots.
+      updateVisualizerLabels();
+      return;
+    }
+
+    if(!enabled){ updateVisualizerLabels(); return; }
+
+    // If this mouse button is bound to an action (e.g., user bound melee to RMB), synthesize original
+    const action = findActionForInputCode(code);
+    if(!action){ updateVisualizerLabels(); return; }
+
+    const original = DEFAULT_BINDINGS[action];
+    if(!original || original === code){ updateVisualizerLabels(); return; }
+
+    e.preventDefault(); e.stopImmediatePropagation();
+    if(original.startsWith('Mouse')){
+      simulateMouse(parseInt(original.slice(5)), 'mousedown');
+      pressedCodes[original] = true;
+    } else {
+      simulateKeyboard(original, 'keydown');
+    }
+
+    updateVisualizerLabels();
+  }
+
+  // MOUSEUP
+  function onMouseUp(e){
+    if(!e.isTrusted) return;
+    if(e.target && e.target.closest && e.target.closest('.narrow-rebind-ui')) return;
+    const code = 'Mouse' + e.button;
+    pressedCodes[code] = false;
+
+    // If right-click scope option enabled and this is right button, swallow to avoid contextmenu double actions
+    if(options.rightClickScope && e.button === 2){
+      e.preventDefault(); e.stopImmediatePropagation();
+      // Already handled on mousedown (toggle), no further action
+      return;
+    }
+
+    // If scoping and left-click occurs we do NOT release scope (per your instruction).
+    // If shoot is rebound away from Mouse0, mouseup may be irrelevant.
+
+    if(!enabled){ updateVisualizerLabels(); return; }
+
+    const action = findActionForInputCode(code);
+    if(!action){ updateVisualizerLabels(); return; }
+
+    const original = DEFAULT_BINDINGS[action];
+    if(!original || original === code){ updateVisualizerLabels(); return; }
+
+    e.preventDefault(); e.stopImmediatePropagation();
+    if(original.startsWith('Mouse')){
+      simulateMouse(parseInt(original.slice(5)), 'mouseup');
+      pressedCodes[original] = false;
+    } else {
+      simulateKeyboard(original, 'keyup');
+    }
+
+    updateVisualizerLabels();
+  }
+
+  // Attach listeners on capture so we can prevent default early
+  document.addEventListener('keydown', onKeyDown, true);
+  document.addEventListener('keyup', onKeyUp, true);
+  document.addEventListener('mousedown', onMouseDown, true);
+  document.addEventListener('mouseup', onMouseUp, true);
+
+  // Prevent context menu globally during gameplay, but allow it when over the UI
+  document.addEventListener('contextmenu', (e)=>{
+    if(e.target && e.target.closest && e.target.closest('.narrow-rebind-ui')) return;
+    if(options.rightClickScope) { e.preventDefault(); } else { e.preventDefault(); } // suppress menu in gameplay
+  }, true);
+
+  // Clear pressed state on blur
+  window.addEventListener('blur', ()=>{
+    for(const k in pressedCodes) pressedCodes[k] = false;
+    updateVisualizerLabels();
+  });
+
+  // Keep visual updated
+  setInterval(updateVisualizerLabels, 100);
+
+  // Ensure UI labels reflect config
+  function updateVisualizerLabels() { // defined earlier, but redeclare safe no-op here if needed
+    for(const a of ACTIONS){
+      const box = keyBoxes[a];
+      if(!box) continue;
+      const labelEl = box.querySelector('.label');
+      const code = bindings[a] || DEFAULT_BINDINGS[a];
+      labelEl.innerText = codeToLabel(code);
+      const isPressed = pressedCodes[code] === true || (a === 'shoot' && scoping === true);
+      box.style.background = isPressed ? 'white' : 'transparent';
+      box.style.color = isPressed ? 'black' : 'white';
+    }
+  }
+
+  /*************************************************************************
+   * Expose helper and initial sync
+   *************************************************************************/
+  refreshActionLabels();
+  updateVisualizerLabels();
+  rightClickToggle.innerText = options.rightClickScope ? 'On':'Off';
+
+  window.__narrow_rebind = {
+    config,
+    saveConfig: ()=> saveConfig(config),
+    loadConfig: ()=> Object.assign(config, loadConfig()),
+    resetToDefaults: ()=> { for(const a of ACTIONS) bindings[a]=DEFAULT_BINDINGS[a]; Object.assign(options, DEFAULT_OPTIONS); saveConfig(config); refreshActionLabels(); updateVisualizerLabels(); }
+  };
+
+  console.log('narrow.one Keybinder + Visualizer v1.2 loaded (Right-click Scope fixed).');
+
+  /*************************************************************************
+   * Re-declare visual functions declared earlier (kept here to ensure closure)
+   *************************************************************************/
+  function refreshActionLabels(){
+    for(const a of ACTIONS){
+      const el = actionRowEls[a];
+      if(!el) continue;
+      el.bindingLabel.innerText = codeToLabel(bindings[a] || DEFAULT_BINDINGS[a]);
+    }
+  }
+
+  // keyBoxes referenced inside updateVisualizerLabels — ensure they exist in this scope
+  // (they were created above; this ensures the function sees them)
+  // updateVisualizerLabels already defined above; call once
+  updateVisualizerLabels();
+
+})();
